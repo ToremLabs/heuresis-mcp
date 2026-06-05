@@ -21,7 +21,7 @@
 import './wsPolyfill.js';
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type { HeuresisCredentials } from './credentials.js';
-import { exchangeRefreshToken } from './gotrue.js';
+import { exchangeRefreshToken, signInWithPassword, type GoTrueSession } from './gotrue.js';
 
 let cached: { client: SupabaseClient; userId: string } | null = null;
 
@@ -33,15 +33,17 @@ export class CloudAuthError extends Error {
 }
 
 /**
- * Build (or return cached) a Supabase client bound to the credentials on
- * disk. Throws CloudAuthError if no credentials exist or if the refresh
- * token has been revoked.
+ * Create a headless Supabase client and seed it with an already-obtained
+ * GoTrue session, so every subsequent PostgREST call carries the user's JWT
+ * and supabase-js keeps the in-memory access token alive. Caches the result.
  */
-export async function getCloudClient(
-  creds: HeuresisCredentials,
+async function seedClient(
+  supabaseUrl: string,
+  anonKey: string,
+  session: GoTrueSession,
+  userId: string,
 ): Promise<{ client: SupabaseClient; userId: string }> {
-  if (cached) return cached;
-  const client = createClient(creds.supabase_url, creds.anon_key, {
+  const client = createClient(supabaseUrl, anonKey, {
     auth: {
       // Headless: no localStorage, no URL detection, no auto-refresh
       // listeners writing to disk. The library still auto-refreshes the
@@ -51,26 +53,37 @@ export async function getCloudClient(
       detectSessionInUrl: false,
     },
   });
-  // Bootstrap the session: exchange the stored refresh token for a fresh
-  // session directly against GoTrue, then seed supabase-js with the REAL
-  // tokens so every subsequent PostgREST call carries the user's JWT and
-  // auto-refresh keeps it alive.
+  const { error } = await client.auth.setSession({
+    access_token: session.access_token,
+    refresh_token: session.refresh_token,
+  });
+  if (error) {
+    throw new CloudAuthError(`Failed to seed Heuresis session: ${error.message}.`);
+  }
+  cached = { client, userId };
+  return cached;
+}
+
+/**
+ * Build (or return cached) a Supabase client bound to the credentials on
+ * disk. Bootstraps by exchanging the stored (rotating) refresh token. Throws
+ * CloudAuthError if the refresh token has been revoked/rotated away.
+ *
+ * NOTE: a stored refresh token is single-use under Supabase rotation, so this
+ * path is unsuitable for ephemeral environments that reuse the same persisted
+ * credential across boots — use getCloudClientFromPassword() for those.
+ */
+export async function getCloudClient(
+  creds: HeuresisCredentials,
+): Promise<{ client: SupabaseClient; userId: string }> {
+  if (cached) return cached;
   try {
     const session = await exchangeRefreshToken(
       creds.supabase_url,
       creds.anon_key,
       creds.refresh_token,
     );
-    const { error } = await client.auth.setSession({
-      access_token: session.access_token,
-      refresh_token: session.refresh_token,
-    });
-    if (error) {
-      throw new CloudAuthError(
-        `Failed to seed Heuresis session: ${error.message}. ` +
-          'Run `npx -y -p @heuresis/mcp heuresis-mcp login` to re-authenticate.',
-      );
-    }
+    return await seedClient(creds.supabase_url, creds.anon_key, session, creds.user_id);
   } catch (err) {
     if (err instanceof CloudAuthError) throw err;
     throw new CloudAuthError(
@@ -79,8 +92,34 @@ export async function getCloudClient(
       }. Run \`npx -y -p @heuresis/mcp heuresis-mcp login\` to re-authenticate.`,
     );
   }
-  cached = { client, userId: creds.user_id };
-  return cached;
+}
+
+/**
+ * Build (or return cached) a Supabase client by signing in fresh with an
+ * email + password. Because a password is not consumed on use, this works
+ * durably across disposable/ephemeral sessions that re-authenticate on every
+ * boot — no persisted, rotating refresh token required. Throws CloudAuthError
+ * on bad credentials or if password sign-in is disabled for the project.
+ */
+export async function getCloudClientFromPassword(
+  supabaseUrl: string,
+  anonKey: string,
+  email: string,
+  password: string,
+): Promise<{ client: SupabaseClient; userId: string }> {
+  if (cached) return cached;
+  try {
+    const session = await signInWithPassword(supabaseUrl, anonKey, email, password);
+    const userId = session.user?.id ?? '(unknown)';
+    return await seedClient(supabaseUrl, anonKey, session, userId);
+  } catch (err) {
+    if (err instanceof CloudAuthError) throw err;
+    throw new CloudAuthError(
+      `Headless email/password sign-in failed: ${
+        err instanceof Error ? err.message : String(err)
+      }. Check HEURESIS_EMAIL / HEURESIS_PASSWORD / HEURESIS_ANON_KEY.`,
+    );
+  }
 }
 
 /** Clear the cached client. Used after logout. */

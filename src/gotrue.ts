@@ -111,3 +111,81 @@ export async function exchangeRefreshToken(
   }
   return session;
 }
+
+/**
+ * Sign in with an email + password directly against the GoTrue token endpoint:
+ *
+ *   POST `${supabaseUrl}/auth/v1/token?grant_type=password`
+ *   headers: { apikey, Authorization: Bearer <anon>, Content-Type: application/json }
+ *   body:    { email, password }
+ *
+ * Unlike a refresh token, a password is NOT consumed on use, so this is the
+ * right primitive for headless, ephemeral environments (e.g. cloud agent
+ * containers) that re-authenticate from scratch on every boot. Returns the
+ * full session (access_token + refresh_token + user). Throws
+ * `RefreshTokenError` with an actionable message on any failure.
+ */
+export async function signInWithPassword(
+  supabaseUrl: string,
+  anonKey: string,
+  email: string,
+  password: string,
+): Promise<GoTrueSession> {
+  if (!email || !password) {
+    throw new RefreshTokenError(
+      'Headless sign-in needs both an email and a password (HEURESIS_EMAIL / HEURESIS_PASSWORD).',
+    );
+  }
+  const url = `${supabaseUrl.replace(/\/$/, '')}/auth/v1/token?grant_type=password`;
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: {
+        apikey: anonKey,
+        Authorization: `Bearer ${anonKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ email, password }),
+    });
+  } catch (err) {
+    throw new RefreshTokenError(
+      `Could not reach the auth endpoint at ${url}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+
+  let payload: unknown = null;
+  try {
+    payload = await res.json();
+  } catch {
+    /* leave null — handled below */
+  }
+
+  if (!res.ok) {
+    const err = payload as
+      | { error_description?: string; error?: string; msg?: string; message?: string }
+      | null;
+    const detail =
+      err?.error_description ?? err?.msg ?? err?.error ?? err?.message ?? `HTTP ${res.status}`;
+    throw new RefreshTokenError(
+      `Email/password sign-in failed (HTTP ${res.status}): ${detail}. ` +
+        'Check HEURESIS_EMAIL / HEURESIS_PASSWORD, and that email+password sign-in is ' +
+        'enabled for the Supabase project.',
+    );
+  }
+
+  const session = payload as GoTrueSession | null;
+  if (!session || !session.access_token || !session.refresh_token) {
+    const keys =
+      session && typeof session === 'object'
+        ? Object.keys(session).join(', ') || '(empty object)'
+        : '(no JSON body)';
+    throw new RefreshTokenError(
+      `Sign-in succeeded (HTTP ${res.status}) but the response is missing ` +
+        `access_token/refresh_token. Response keys: [${keys}].`,
+    );
+  }
+  return session;
+}

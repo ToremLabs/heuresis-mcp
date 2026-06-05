@@ -43,13 +43,15 @@ import {
 } from './tools.js';
 import { CLOUD_TOOLS, type CloudToolDef } from './cloudTools.js';
 import { readCredentials } from './credentials.js';
-import { CloudAuthError, getCloudClient } from './cloudClient.js';
+import { CloudAuthError, getCloudClient, getCloudClientFromPassword } from './cloudClient.js';
 import {
+  DEFAULT_SUPABASE_URL,
   helpCommand,
   loginCommand,
   logoutCommand,
   whoamiCommand,
 } from './cli.js';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import {
   readRealtimeFlag,
   resolveSubscriptionWorkspaceId,
@@ -87,6 +89,22 @@ function makeCloudTools(
     inputSchema: t.inputSchema,
     handler: async (args: unknown) => t.handler(await getClient(), args),
   }));
+}
+
+// Phase 19.5 — try to load LLM-backed Operator tools. The module may be absent
+// or export nothing; in that case we fall back to just the Phase 19.4 parity
+// set. Wrapping the dynamic import in try/catch keeps the server starting
+// cleanly either way.
+async function loadOperatorTools(): Promise<CloudToolDef[]> {
+  try {
+    const mod = (await import('./cloudOperators.js').catch(() => null)) as
+      | { OPERATOR_TOOLS?: CloudToolDef[] }
+      | null;
+    if (mod && Array.isArray(mod.OPERATOR_TOOLS)) return mod.OPERATOR_TOOLS;
+  } catch {
+    /* fall through to empty */
+  }
+  return [];
 }
 
 function makeLegacySnapshotTools(store: HeuresisStore): ToolDef<unknown>[] {
@@ -150,39 +168,63 @@ async function runServer(): Promise<void> {
   const creds = await readCredentials();
   const snapshotEnv = process.env.HEURESIS_SNAPSHOT;
 
+  // Headless credential (durable across ephemeral/disposable sessions): when
+  // HEURESIS_EMAIL + HEURESIS_PASSWORD are set, the server signs in fresh on
+  // every boot. Unlike a persisted refresh token — which is single-use under
+  // Supabase rotation and dies after one session — a password is not consumed,
+  // so this survives container resets with zero re-pairing. It takes
+  // precedence over a (possibly stale) credentials.json.
+  const headlessEmail = process.env.HEURESIS_EMAIL?.trim();
+  const headlessPassword = process.env.HEURESIS_PASSWORD;
+
   let tools: ToolDef<unknown>[];
   let modeBanner: string;
+  // Single cloud client getter, shared by the tool handlers and the realtime
+  // subscription. null in legacy snapshot / unconfigured modes.
+  let cloudGetClient: (() => Promise<SupabaseClient>) | null = null;
 
-  if (creds) {
-    // CLOUD mode.
-    const getClient = async () => {
+  if (headlessEmail && headlessPassword) {
+    // CLOUD mode — headless email/password sign-in (recommended for cloud /
+    // disposable containers).
+    const supabaseUrl = process.env.HEURESIS_SUPABASE_URL?.trim() || DEFAULT_SUPABASE_URL;
+    const anonKey = process.env.HEURESIS_ANON_KEY?.trim();
+    if (!anonKey) {
+      console.error(
+        [
+          '[heuresis-mcp] HEURESIS_EMAIL/HEURESIS_PASSWORD are set but HEURESIS_ANON_KEY is missing.',
+          'Set HEURESIS_ANON_KEY to your project anon/publishable key (it is public, not a secret).',
+        ].join('\n'),
+      );
+      process.exit(1);
+    }
+    cloudGetClient = async () => {
+      try {
+        const { client } = await getCloudClientFromPassword(
+          supabaseUrl,
+          anonKey,
+          headlessEmail,
+          headlessPassword,
+        );
+        return client;
+      } catch (err) {
+        if (err instanceof CloudAuthError) throw new Error(err.message);
+        throw err;
+      }
+    };
+    tools = makeCloudTools(cloudGetClient, await loadOperatorTools());
+    modeBanner = `cloud-authenticated (headless ${headlessEmail}; ${tools.length} tools)`;
+  } else if (creds) {
+    // CLOUD mode — persisted device credential (refresh-token bootstrap).
+    cloudGetClient = async () => {
       try {
         const { client } = await getCloudClient(creds);
         return client;
       } catch (err) {
-        if (err instanceof CloudAuthError) {
-          throw new Error(err.message);
-        }
+        if (err instanceof CloudAuthError) throw new Error(err.message);
         throw err;
       }
     };
-    // Phase 19.5 — try to load Operator tools. The module may not exist
-    // yet at build time (Agent A ships it in a parallel pass); if it's
-    // missing OR exports nothing, we fall back to just the Phase 19.4
-    // parity set. Wrapping the dynamic import in try/catch keeps the
-    // server starting cleanly in either case.
-    let operatorTools: CloudToolDef[] = [];
-    try {
-      const mod = (await import('./cloudOperators.js').catch(() => null)) as
-        | { OPERATOR_TOOLS?: CloudToolDef[] }
-        | null;
-      if (mod && Array.isArray(mod.OPERATOR_TOOLS)) {
-        operatorTools = mod.OPERATOR_TOOLS;
-      }
-    } catch {
-      operatorTools = [];
-    }
-    tools = makeCloudTools(getClient, operatorTools);
+    tools = makeCloudTools(cloudGetClient, await loadOperatorTools());
     modeBanner = `cloud-authenticated (user_id ${creds.user_id}, device ${creds.device_name}; ${tools.length} tools)`;
   } else if (snapshotEnv || hasDefaultSnapshot()) {
     // LEGACY snapshot fallback.
@@ -195,8 +237,14 @@ async function runServer(): Promise<void> {
       [
         '[heuresis-mcp] Not configured.',
         '',
-        'To use cloud mode (recommended):',
+        'To use cloud mode on a personal machine (device pairing):',
         '  npx -y -p @heuresis/mcp heuresis-mcp login',
+        '',
+        'To use cloud mode headlessly (CI / cloud agents / disposable containers),',
+        'set these env vars so the server signs in fresh on every boot:',
+        '  HEURESIS_EMAIL      your Heuresis account email',
+        '  HEURESIS_PASSWORD   your Heuresis account password',
+        '  HEURESIS_ANON_KEY   your project anon/publishable key (public, not a secret)',
         '',
         'To use legacy snapshot mode (deprecated, removed after 19.7):',
         '  HEURESIS_SNAPSHOT=/path/to/export.json npx @heuresis/mcp',
@@ -270,7 +318,7 @@ async function runServer(): Promise<void> {
 
   // Phase 19.8 - Supabase Realtime CDC subscription. Cloud mode only; legacy
   // snapshot mode has no live source to subscribe to.
-  if (creds) {
+  if (cloudGetClient) {
     const realtimeOn = await readRealtimeFlag();
     if (!realtimeOn) {
       console.error('[heuresis-mcp] realtime: disabled (--no-realtime or config).');
@@ -279,7 +327,7 @@ async function runServer(): Promise<void> {
       // client (Supabase) is not reachable, the error surfaces on stderr.
       void (async () => {
         try {
-          const { client } = await getCloudClient(creds);
+          const client = await cloudGetClient();
           const wsId = await resolveSubscriptionWorkspaceId(client);
           if (!wsId) {
             console.error('[heuresis-mcp] realtime: no workspace visible; skipping subscription.');

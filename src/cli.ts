@@ -43,7 +43,7 @@ import { exchangeRefreshToken, RefreshTokenError } from './gotrue.js';
 // allow HEURESIS_SUPABASE_URL to override which Supabase project the CLI
 // talks to (e.g. a staging instance). Both default to production.
 const DEFAULT_DEVICE_BASE_URL = 'https://heuresis.app';
-const DEFAULT_SUPABASE_URL = 'https://wpgniquyuppljeqkedqh.supabase.co';
+export const DEFAULT_SUPABASE_URL = 'https://wpgniquyuppljeqkedqh.supabase.co';
 
 const POLL_INTERVAL_MS = 5_000;
 const POLL_TIMEOUT_MS = 15 * 60 * 1_000;

@@ -1,6 +1,6 @@
 {
   "name": "@heuresis/mcp",
-  "version": "1.0.0-rc.10",
+  "version": "1.0.0-rc.11",
   "mcpName": "io.github.ToremLabs/heuresis",
   "description": "Cloud-authenticated Model Context Protocol server for a Heuresis workspace. Logs into the user's Heuresis account and lets any MCP client (Claude Desktop, Claude Code, Cursor, custom agents) read and write the same workspace the webapp uses. 31 data tools, 3 operator tools (Branch/Matrix/C-K/ASIT/TRIZ/Free/Combine/Explore), and live Realtime change subscriptions.",
   "type": "module",

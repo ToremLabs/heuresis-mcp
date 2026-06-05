@@ -89,6 +89,36 @@ npx -y @heuresis/mcp --no-realtime            # boot the server with live sync o
 npx -y @heuresis/mcp --realtime               # re-enable live sync
 ```
 
+## Headless mode (CI, cloud agents, disposable containers)
+
+Device pairing writes a **refresh token** to disk. That works great on a
+personal machine, but it does **not** survive disposable/ephemeral
+environments (CI runners, cloud agent containers, "Claude Code on the web"):
+the filesystem is wiped between runs, and a Supabase refresh token is
+**single-use under rotation** — so a token baked into config dies after the
+first session.
+
+For those environments, skip pairing and let the server **sign in fresh on
+every boot** from your account email + password (a password is not consumed on
+use, so it works forever with no re-pairing). Set three env vars:
+
+```bash
+HEURESIS_EMAIL=you@example.com          # your Heuresis account email
+HEURESIS_PASSWORD=your-account-password # secret — store it in a secrets manager
+HEURESIS_ANON_KEY=sb_publishable_...    # project anon/publishable key (public, not a secret)
+# optional: HEURESIS_SUPABASE_URL=...   # defaults to the production project
+```
+
+When `HEURESIS_EMAIL` + `HEURESIS_PASSWORD` are present they take precedence
+over any `credentials.json`, and the MCP server authenticates per boot — no
+device link required. Requirements:
+
+- Email + password sign-in must be enabled for the Supabase project, and the
+  account must have a password set (passwordless / magic-link-only accounts
+  need a password added first).
+- Treat `HEURESIS_PASSWORD` as a secret. Prefer a dedicated account if your
+  environment can only expose env vars that are visible to its users.
+
 ## Live sync
 
 When the MCP boots in cloud mode it subscribes to the workspace over

@@ -79,8 +79,37 @@ function leafSchema(schema: z.ZodTypeAny): JsonSchema {
   return out;
 }
 
-export function zodToJsonSchema(schema: z.ZodObject<z.ZodRawShape>): JsonSchema {
-  const shape = schema.shape;
+export function zodToJsonSchema(schema: z.ZodTypeAny): JsonSchema {
+  // Peel wrappers to reach the underlying object whose `.shape` we can
+  // introspect: `.refine()`/`.transform()`/`.superRefine()` produce a
+  // ZodEffects (no `.shape`), and optional/default/nullable wrap the root too.
+  // Without this, a tool whose inputSchema is a ZodEffects (e.g. expand_concept)
+  // makes `Object.entries(undefined)` throw — which previously took down the
+  // ENTIRE tools/list response and caused MCP clients to drop the server.
+  let root: z.ZodTypeAny = schema;
+  while (root && (root as { _def?: unknown })._def) {
+    if (root instanceof z.ZodEffects) {
+      root = (root._def as { schema: z.ZodTypeAny }).schema;
+      continue;
+    }
+    if (
+      root instanceof z.ZodOptional ||
+      root instanceof z.ZodDefault ||
+      root instanceof z.ZodNullable
+    ) {
+      root = (root._def as { innerType: z.ZodTypeAny }).innerType;
+      continue;
+    }
+    break;
+  }
+
+  const shape = (root as z.ZodObject<z.ZodRawShape>)?.shape;
+  if (!shape || typeof shape !== 'object') {
+    // Not an object schema we can introspect — expose a permissive object so
+    // the tool still lists and still accepts its arguments.
+    return { type: 'object', additionalProperties: true };
+  }
+
   const properties: Record<string, JsonSchema> = {};
   const required: string[] = [];
   for (const [key, value] of Object.entries(shape)) {
